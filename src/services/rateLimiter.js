@@ -4,6 +4,7 @@ const fixedWindow = require('./algorithms/fixedWindow');
 const Rule = require('../models/Rule');
 const { getRedis } = require('../config/redis');
 const logger = require('../utils/logger');
+const { ruleCacheOps, redisOpDurationMs } = require('../config/metrics');
 
 const ALGORITHMS = {
   sliding_window: slidingWindow,
@@ -13,9 +14,9 @@ const ALGORITHMS = {
 
 // Plan-level defaults when no specific rule exists
 const PLAN_DEFAULTS = {
-  free:       { limit: 60,   windowMs: 60000, algorithm: 'fixed_window' },
-  pro:        { limit: 1000, windowMs: 60000, algorithm: 'sliding_window' },
-  enterprise: { limit: 10000,windowMs: 60000, algorithm: 'token_bucket', burstLimit: 15000 },
+  free:       { limit: 60,    windowMs: 60000, algorithm: 'fixed_window' },
+  pro:        { limit: 1000,  windowMs: 60000, algorithm: 'sliding_window' },
+  enterprise: { limit: 10000, windowMs: 60000, algorithm: 'token_bucket', burstLimit: 15000 },
 };
 
 /**
@@ -27,7 +28,13 @@ async function resolveRule(tenant, endpoint) {
   const redis = getRedis();
   const cacheKey = `ratelimitr:rule:${tenant.id}:${endpoint}`;
   const cached = await redis.get(cacheKey);
-  if (cached) return JSON.parse(cached);
+
+  if (cached) {
+    ruleCacheOps.inc({ op: 'hit' });
+    return JSON.parse(cached);
+  }
+
+  ruleCacheOps.inc({ op: 'miss' });
 
   // Try exact match, then wildcard
   let rule = await Rule.findOne({ where: { tenantId: tenant.id, endpoint } });
@@ -44,9 +51,9 @@ async function resolveRule(tenant, endpoint) {
 /**
  * Core check: is this request allowed?
  *
- * @param {object} tenant   - Tenant model instance
+ * @param {object} tenant     - Tenant model instance
  * @param {string} identifier - End-user identifier (IP, userId, etc.)
- * @param {string} endpoint - The API endpoint being protected (e.g. "POST /login")
+ * @param {string} endpoint   - The API endpoint being protected (e.g. "POST /login")
  */
 async function checkRateLimit(tenant, identifier, endpoint) {
   if (!tenant.isActive) {
@@ -61,6 +68,8 @@ async function checkRateLimit(tenant, identifier, endpoint) {
     return { allowed: true, reason: 'algorithm_fallback' }; // fail open
   }
 
+  // Track Redis Lua script latency separately from total check latency
+  const endRedis = redisOpDurationMs.startTimer({ algorithm: rule.algorithm });
   const result = await algorithm({
     tenantId: tenant.id,
     identifier,
@@ -69,8 +78,9 @@ async function checkRateLimit(tenant, identifier, endpoint) {
     windowMs: rule.windowMs,
     burstLimit: rule.burstLimit,
   });
+  endRedis();
 
-  // Track analytics (fire-and-forget)
+  // Track analytics (fire-and-forget — never block the response)
   trackUsage(tenant.id, endpoint, result.allowed).catch(() => {});
 
   return {
@@ -84,8 +94,8 @@ async function checkRateLimit(tenant, identifier, endpoint) {
 }
 
 /**
- * Increment usage counters for analytics.
- * Uses Redis HyperLogLog for unique identifiers + simple counters for totals.
+ * Increment per-tenant daily usage counters for the analytics endpoint.
+ * Kept in Redis with 8-day TTL — no DB write on every request.
  */
 async function trackUsage(tenantId, endpoint, allowed) {
   const redis = getRedis();
@@ -95,7 +105,7 @@ async function trackUsage(tenantId, endpoint, allowed) {
   await Promise.all([
     redis.incr(`${base}:total`),
     allowed ? redis.incr(`${base}:allowed`) : redis.incr(`${base}:denied`),
-    redis.expire(`${base}:total`, 86400 * 8),   // keep 8 days
+    redis.expire(`${base}:total`, 86400 * 8),
     redis.expire(`${base}:allowed`, 86400 * 8),
     redis.expire(`${base}:denied`, 86400 * 8),
   ]);

@@ -1,0 +1,566 @@
+openapi: 3.0.3
+
+info:
+  title: RateLimitr API
+  description: |
+    **Distributed Rate Limiter as a Service** — multi-tenant, Redis-backed, algorithm-pluggable.
+
+    ## Authentication
+    Two auth methods are used:
+    - **X-API-Key** header — for the `/check` hot path (fast, Redis-cached)
+    - **Bearer JWT** — for the management API (rules, analytics, tenant profile)
+
+    Get your API key from `POST /api/v1/auth/register`.  
+    Exchange it for a JWT via `POST /api/v1/auth/login`.
+
+    ## Algorithms
+    | Algorithm | Best for | Tradeoff |
+    |---|---|---|
+    | `sliding_window` | Auth endpoints, payments | Higher memory usage |
+    | `token_bucket` | APIs allowing bursts | Opaque burst window |
+    | `fixed_window` | Coarse daily/hourly quotas | Boundary burst possible |
+
+  version: 2.0.0
+  contact:
+    name: RateLimitr
+    url: https://github.com/your-username/ratelimitr
+
+servers:
+  - url: http://localhost:3000/api/v1
+    description: Local development
+  - url: https://your-production-domain.com/api/v1
+    description: Production
+
+tags:
+  - name: Auth
+    description: Register tenants and obtain tokens
+  - name: Check
+    description: The hot path — check if a request is allowed
+  - name: Rules
+    description: Configure per-endpoint rate limit rules
+  - name: Analytics
+    description: Usage statistics and denial trends
+  - name: Tenants
+    description: Tenant profile management
+  - name: Observability
+    description: Health and Prometheus metrics
+
+# ─── Reusable Components ──────────────────────────────────────────────────────
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    CheckRequest:
+      type: object
+      required: [identifier, endpoint]
+      properties:
+        identifier:
+          type: string
+          description: End-user identifier — IP address, userId, sessionId, etc.
+          example: "user-12345"
+        endpoint:
+          type: string
+          description: The route being protected. Must match a configured rule or falls back to plan default.
+          example: "POST /api/checkout"
+
+    CheckResponse:
+      type: object
+      properties:
+        allowed:
+          type: boolean
+          example: true
+        remaining:
+          type: integer
+          description: Tokens/requests remaining in the current window
+          example: 42
+        algorithm:
+          type: string
+          enum: [sliding_window, token_bucket, fixed_window]
+          example: sliding_window
+        retryAfterMs:
+          type: integer
+          description: Milliseconds until the client should retry (only present on 429)
+          example: 3200
+        rule:
+          type: object
+          properties:
+            algorithm:
+              type: string
+            limit:
+              type: integer
+            windowMs:
+              type: integer
+
+    Rule:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        tenantId:
+          type: string
+          format: uuid
+        endpoint:
+          type: string
+          example: "POST /api/login"
+        algorithm:
+          type: string
+          enum: [sliding_window, token_bucket, fixed_window]
+        limit:
+          type: integer
+          example: 5
+        windowMs:
+          type: integer
+          example: 60000
+        burstLimit:
+          type: integer
+          nullable: true
+          description: Max burst tokens (token_bucket only)
+          example: 10
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    RuleInput:
+      type: object
+      required: [endpoint, algorithm, limit, windowMs]
+      properties:
+        endpoint:
+          type: string
+          example: "POST /api/login"
+        algorithm:
+          type: string
+          enum: [sliding_window, token_bucket, fixed_window]
+          example: sliding_window
+        limit:
+          type: integer
+          minimum: 1
+          example: 5
+        windowMs:
+          type: integer
+          minimum: 1000
+          example: 60000
+        burstLimit:
+          type: integer
+          nullable: true
+          example: 10
+
+    Tenant:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        plan:
+          type: string
+          enum: [free, pro, enterprise]
+        isActive:
+          type: boolean
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+          example: "Missing required fields: identifier, endpoint"
+
+    AnalyticsSummary:
+      type: object
+      properties:
+        tenantId:
+          type: string
+          format: uuid
+        summary:
+          type: array
+          items:
+            type: object
+            properties:
+              date:
+                type: string
+                format: date
+                example: "2026-04-09"
+              total:
+                type: integer
+                example: 12400
+              allowed:
+                type: integer
+                example: 11980
+              denied:
+                type: integer
+                example: 420
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid credentials
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    TooManyRequests:
+      description: Rate limit exceeded
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+          description: Seconds until client can retry
+        X-RateLimit-Limit:
+          schema:
+            type: integer
+        X-RateLimit-Remaining:
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/CheckResponse'
+
+# ─── Paths ────────────────────────────────────────────────────────────────────
+
+paths:
+
+  # AUTH ───────────────────────────────────────────────────────────────────────
+
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: Register a new tenant
+      description: |
+        Creates a tenant and returns a one-time API key.  
+        **Store the API key immediately** — it is hashed on storage and cannot be retrieved again.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  example: "MyStartup"
+                plan:
+                  type: string
+                  enum: [free, pro, enterprise]
+                  default: free
+      responses:
+        '201':
+          description: Tenant created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tenantId:
+                    type: string
+                    format: uuid
+                  apiKey:
+                    type: string
+                    example: "rl_a1b2c3d4e5f6..."
+                  plan:
+                    type: string
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Exchange API key for JWT
+      description: |
+        Returns a JWT for use with the management API (rules, analytics, tenant profile).  
+        The JWT expires in 7 days by default.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [apiKey]
+              properties:
+                apiKey:
+                  type: string
+                  example: "rl_a1b2c3d4e5f6..."
+      responses:
+        '200':
+          description: JWT issued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token:
+                    type: string
+                  tenantId:
+                    type: string
+                    format: uuid
+                  plan:
+                    type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # CHECK (HOT PATH) ───────────────────────────────────────────────────────────
+
+  /check:
+    post:
+      tags: [Check]
+      summary: Check if a request is rate-limited
+      description: |
+        **The hot path.** Called by your SDK on every incoming request.
+
+        Target latency: **p99 < 10ms** (all computation runs in atomic Redis Lua scripts).
+
+        Rule resolution priority:
+        1. Exact endpoint match (e.g. `"POST /api/login"`)
+        2. Wildcard rule (`"*"`)
+        3. Plan default (free: 60/min, pro: 1000/min, enterprise: 10000/min)
+
+        **Fail-open**: if RateLimitr is unreachable, the SDK returns `allowed: true`
+        so your users are never blocked due to our downtime.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckRequest'
+            examples:
+              byIP:
+                summary: Rate limit by IP address
+                value:
+                  identifier: "203.0.113.42"
+                  endpoint: "POST /api/login"
+              byUserId:
+                summary: Rate limit by authenticated user
+                value:
+                  identifier: "user-12345"
+                  endpoint: "POST /api/checkout"
+      responses:
+        '200':
+          description: Request allowed
+          headers:
+            X-RateLimit-Limit:
+              schema: { type: integer }
+            X-RateLimit-Remaining:
+              schema: { type: integer }
+            X-RateLimit-Algorithm:
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckResponse'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # RULES ──────────────────────────────────────────────────────────────────────
+
+  /rules:
+    get:
+      tags: [Rules]
+      summary: List all rules for your tenant
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: List of rules
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Rule'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    post:
+      tags: [Rules]
+      summary: Create a rate limit rule
+      description: |
+        Creates a rule for a specific endpoint. Rule changes propagate within **60 seconds**
+        (Redis cache TTL). Use `"*"` as endpoint for a catch-all rule.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RuleInput'
+            examples:
+              loginProtection:
+                summary: Protect login endpoint
+                value:
+                  endpoint: "POST /api/login"
+                  algorithm: sliding_window
+                  limit: 5
+                  windowMs: 60000
+              checkoutWithBurst:
+                summary: Checkout with burst allowance
+                value:
+                  endpoint: "POST /api/checkout"
+                  algorithm: token_bucket
+                  limit: 100
+                  windowMs: 60000
+                  burstLimit: 150
+      responses:
+        '201':
+          description: Rule created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Rule'
+        '409':
+          description: Rule for this endpoint already exists
+
+  /rules/{id}:
+    put:
+      tags: [Rules]
+      summary: Update a rule
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RuleInput'
+      responses:
+        '200':
+          description: Rule updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Rule'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      tags: [Rules]
+      summary: Delete a rule
+      description: Endpoint falls back to plan default after deletion.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Rule deleted
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ANALYTICS ──────────────────────────────────────────────────────────────────
+
+  /analytics/summary:
+    get:
+      tags: [Analytics]
+      summary: Daily usage breakdown
+      description: Returns total, allowed, and denied request counts per day for up to 8 days.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: days
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 8
+            default: 7
+          description: Number of days to include in the summary
+      responses:
+        '200':
+          description: Analytics summary
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnalyticsSummary'
+
+  # TENANTS ────────────────────────────────────────────────────────────────────
+
+  /tenants/me:
+    get:
+      tags: [Tenants]
+      summary: Get your tenant profile
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Tenant profile
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Tenant'
+
+    patch:
+      tags: [Tenants]
+      summary: Update tenant name
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+      responses:
+        '200':
+          description: Updated tenant
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Tenant'
+
+  # OBSERVABILITY ──────────────────────────────────────────────────────────────
+
+  /health:
+    get:
+      tags: [Observability]
+      summary: Health check
+      description: Returns server status and timestamp. Use for load balancer health probes.
+      responses:
+        '200':
+          description: Server healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  ts:
+                    type: integer
+                    example: 1712659200000
